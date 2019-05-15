@@ -5,32 +5,22 @@
 #include <ESP8266WiFi.h> // WIFI
 #include <WiFiClient.h>  // WIFI
 #include <PubSubClient.h>// MQTT
-/************************/
-/*       CONSTS         */
-/************************/
-// WIFI
-#define wifi_ssid "GreenPi"
-#define wifi_password "greenpimdp123"
-// MQTT 
-#define mqtt_server "10.3.141.1"
-#define synchro_topic "helloGP"
-// GPIOS
-#define periphPin D1
+#include <EEPROM.h>      // DB
+#include <ArduinoJson.h> // JSON
+#include <SettingsManager.h>   // Config file manager
+#include <ESP8266TrueRandom.h> // UID generator
+
 /************************/
 /*       VARIABLES      */
 /************************/
-// MQTT
-String TYPE = "_lamp";
-String MQTTTopic;
-boolean isSynchro = false;
 long lastSynchro = 0;
-// GPIOS
-boolean periphState = false;
+long lastMoistureSynchro = 0;
 /************************/
 /*       CLASS DEF      */
 /************************/
 WiFiClient espClient;
 PubSubClient client(espClient);
+SettingsManager sm;
 /************************/
 /*       FUNCTIONS      */
 /************************/
@@ -39,14 +29,17 @@ void setup_wifi() {
   delay(10);
   Serial.println();
   Serial.print("Connexion a ");
-  Serial.println(wifi_ssid);
+  Serial.println(sm.getChar("wifi.ssid", "Not found..."));
  
-  WiFi.begin(wifi_ssid, wifi_password);
+  WiFi.begin(sm.getChar("wifi.ssid", "GrenPi"), sm.getChar("wifi.password", ""));
  
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
+
+  sm.setString("device.macAddress", WiFi.macAddress());
+  sm.writeSettings("/config.json");
 
   Serial.println("");
   Serial.println("WiFi connected ");
@@ -55,8 +48,6 @@ void setup_wifi() {
   Serial.print("=> Addresse MAC : ");
   Serial.println(WiFi.macAddress());
   Serial.println("");
-
-  MQTTTopic = WiFi.macAddress() + TYPE;
 }
 // MQTT connection
 void reconnect() {
@@ -68,8 +59,7 @@ void reconnect() {
     // Attempt to connect
     if (client.connect(clientId.c_str())) {
       Serial.println("connected");
-      //client.subscribe(synchro_topic);
-      client.subscribe(MQTTTopic.c_str());
+      client.subscribe(sm.getChar("device.uid", ""));
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -81,65 +71,105 @@ void reconnect() {
 }
 // MQTT Callback
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-  int i = 0;
-  char s[length];
-  
   Serial.println("");
   Serial.println("=== NEW MESSAGE ===");
   Serial.println("Topic: " + String(topic));
   Serial.println("Length: " + String(length,DEC));
-  
-  // create character buffer with ending null terminator (string)
-  for(i=0; i<length; i++) {
-    s[i] = payload[i];
+
+  StaticJsonDocument<256> jsonDoc;
+  DeserializationError error = deserializeJson(jsonDoc, payload, length);
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.c_str());
+    return;
   }
-  s[i] = '\0';
 
-  Serial.print("payload: ");
-  Serial.println(s);
+  serializeJsonPretty(jsonDoc, Serial);
 
-  messageHandler(s);
+  messageHandler(jsonDoc.as<JsonObject>());
 }
 // MQTT ROUTER
-void messageHandler(String message) {
-  if (message == "synchronised") {
-    isSynchro = true;
-    Serial.println("Synchronisé !");
-  } else if(message == "ON") {
-    digitalWrite(periphPin, HIGH);
-    periphState = true;
-  } else if (message == "OFF") {
-    digitalWrite(periphPin, LOW);
-    periphState = false;
-  } else if (message == "toggle") {
-    periphState = !periphState;
-    digitalWrite(periphPin, periphState ? HIGH : LOW);
-  } else if (message == "state") {
-    client.publish(MQTTTopic.c_str(), String(periphState).c_str(), true);
+void messageHandler(JsonObject doc) {
+  String action = doc["action"];
+
+  if (action == "boardSynchro") {
+    String state = doc["state"];
+    String uid = doc["uid"];
+    if (state == "ok") {
+      if (sm.getString("device.uid") != uid) {
+        sm.setString("device.uid", uid);
+      }
+      sm.setBool("device.synchronised", true);
+      sm.writeSettings("/config.json");
+      Serial.println("Synchronisé !");
+    }
+  }
+
+  if (action == "command") {
+    String value = doc["value"];
+
+    if (value == "state") {
+      readMoisture();
+    }
   }
 }
 // Synchro Manager
 void handleSynchro() {
   long now = millis();
-  if (now - lastSynchro > 1000 * 20) {
+  if (now - lastSynchro > 1000 * 30) {
     lastSynchro = now;
     Serial.println("Envoi d'un message de synchro");
+    
+    char buffer[256];
+    serializeJson(sm.getJsonObject("device"), buffer);
+    
+    client.publish(sm.getChar("mqtt.topics.synchro","helloGP"), buffer, false);
+  }
+}
 
-    String SynchroMsg = "{\"topic\":\"" + MQTTTopic + "\",\"type\":\"lamp\"}";
+void readMoisture() {
+  long now = millis();
+  if (now - lastMoistureSynchro > 1000 * 600) {
+    lastMoistureSynchro = now;
 
-    client.publish(synchro_topic, SynchroMsg.c_str(), true);
+    int value = analogRead(sm.getInt("device.pin"));
+    Serial.print("Moisture level : ");
+    Serial.println(value);
+
+    const size_t capacity = JSON_OBJECT_SIZE(2);
+    DynamicJsonDocument doc(capacity);
+    doc["action"] = "response";
+    doc["state"] = value;
+
+    char buffer[512];
+    serializeJson(doc, buffer);
+    client.publish(sm.getChar("device.uid", ""), buffer, true);
   }
 }
 
 void setup() {
   Serial.begin(9600);
-
+  
+  // Settings manager
+  sm.readSettings("/config.json"); //Loading json from file config.json
+  
+  // Connect Wifi and MQTT
   setup_wifi();
-  client.setServer(mqtt_server, 1883);
+  client.setServer(sm.getChar("mqtt.server", ""), 1883);
   client.setCallback(mqtt_callback);
 
+  // Manage UID
+  String uid = sm.getString("device.uid");
+  if (uid.length() == 0) {
+    byte uuidNumber[16];
+    ESP8266TrueRandom.uuid(uuidNumber);
+    String uuid = ESP8266TrueRandom.uuidToString(uuidNumber);
+    int res = sm.setString("device.uid", uuid);
+    sm.writeSettings("/config.json");
+  }
+
   // Setup GPIOS
-  pinMode(periphPin, OUTPUT);
+  pinMode(sm.getUInt("device.pin"), INPUT);
 }
 
 void loop() {
@@ -148,7 +178,8 @@ void loop() {
   }
   client.loop();
 
-  if (!isSynchro) {
+  if (!sm.getBool("device.synchronised")) {
     handleSynchro();
   }
+  readMoisture();
 }

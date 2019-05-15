@@ -1,0 +1,19 @@
+{
+  "wifi": {
+    "ssid": "GreenPi",
+    "password": "greenpimdp123"
+  },
+  "mqtt": {
+    "server": "10.3.141.1",
+    "topics": {
+      "synchro": "helloGP"
+    }
+  },
+  "device": {
+    "type": "moisture",
+    "pin": "A0",
+    "macAddress": "",
+    "uid": "",
+    "synchronised": false
+  }
+}
